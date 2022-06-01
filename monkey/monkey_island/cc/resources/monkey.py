@@ -1,0 +1,174 @@
+import json
+from datetime import datetime
+
+from flask import request
+
+from monkey_island.cc.database import mongo
+from monkey_island.cc.models.monkey_ttl import create_monkey_ttl_document
+from monkey_island.cc.resources.AbstractResource import AbstractResource
+from monkey_island.cc.resources.blackbox.utils.telem_store import TestTelemStore
+from monkey_island.cc.resources.utils.semaphores import agent_killing_mutex
+from monkey_island.cc.server_utils.consts import DEFAULT_MONKEY_TTL_EXPIRY_DURATION_IN_SECONDS
+from monkey_island.cc.services.config import ConfigService
+from monkey_island.cc.services.edge.edge import EdgeService
+from monkey_island.cc.services.node import NodeService
+
+# TODO: separate logic from interface
+
+
+class Monkey(AbstractResource):
+    # API Spec: Resource name should be plural
+    urls = [
+        "/api/agent",
+        "/api/agent/<string:guid>",
+        # API Spec: Resource names should alternate with IDs (/api/agents/123/config-format/xyz)
+        "/api/agent/<string:guid>/<string:config_format>",
+    ]
+
+    # Used by monkey. can't secure.
+    def get(self, guid=None, config_format=None, **kw):
+        if not guid:
+            guid = request.args.get("guid")
+
+        if guid:
+            monkey_json = mongo.db.monkey.find_one_or_404({"guid": guid})
+            # TODO: When the "legacy" format is no longer needed, update this logic and remove the
+            #       "/api/agent/<string:guid>/<string:config_format>" route. Also considering not
+            #       flattening the config in the first place.
+            if config_format == "legacy":
+                ConfigService.decrypt_flat_config(monkey_json["config"])
+            else:
+                ConfigService.format_flat_config_for_agent(monkey_json["config"])
+
+            return monkey_json
+
+        return {}
+
+    # Used by monkey. can't secure.
+    @TestTelemStore.store_exported_telem
+    def patch(self, guid):
+
+        # TODO: This endpoint appears to be doing 3 things, although only one of them is used
+        # (config_error). The WormConfiguration will be removed in #1960. We should consider
+        # removing this endpoint
+        monkey_json = json.loads(request.data)
+        update = {"$set": {"modifytime": datetime.now()}}
+        monkey = NodeService.get_monkey_by_guid(guid)
+        if "config" in monkey_json:
+            update["$set"]["config"] = monkey_json["config"]
+        if "config_error" in monkey_json:
+            update["$set"]["config_error"] = monkey_json["config_error"]
+
+        if "tunnel" in monkey_json:
+            tunnel_host_ip = monkey_json["tunnel"].split(":")[-2].replace("//", "")
+            NodeService.set_monkey_tunnel(monkey["_id"], tunnel_host_ip)
+
+        ttl = create_monkey_ttl_document(DEFAULT_MONKEY_TTL_EXPIRY_DURATION_IN_SECONDS)
+        update["$set"]["ttl_ref"] = ttl.id
+
+        # API Spec: What is this returning? Check that it follows rules.
+        return mongo.db.monkey.update({"_id": monkey["_id"]}, update, upsert=False)
+
+    # Used by monkey. can't secure.
+    # Called on monkey wakeup to initialize local configuration
+    @TestTelemStore.store_exported_telem
+    def post(self, **kw):
+
+        # TODO: Why is it the registration of an agent coupled to exploit telemetry? It's hard to
+        #       understand why an agent registering itself should be so complicated. Is it because
+        #       agent state (dead) and config are conflated? Figure out why this thing is so
+        #       complicated. Then simplify it.
+        with agent_killing_mutex:
+            monkey_json = json.loads(request.data)
+            monkey_json["dead"] = False
+
+            monkey_json["modifytime"] = datetime.now()
+
+            ConfigService.save_initial_config_if_needed()
+
+            # if new monkey telem, change config according to "new monkeys" config.
+            db_monkey = mongo.db.monkey.find_one({"guid": monkey_json["guid"]})
+
+            # Update monkey configuration
+            new_config = ConfigService.get_flat_config(False, False)
+            monkey_json["config"] = monkey_json.get("config", {})
+            monkey_json["config"].update(new_config)
+
+            # try to find new monkey parent
+            parent = monkey_json.get("parent")
+            parent_to_add = (monkey_json.get("guid"), None)  # default values in case of manual run
+            if parent and parent != monkey_json.get("guid"):  # current parent is known
+                exploit_telem = [
+                    x
+                    for x in mongo.db.telemetry.find(
+                        {
+                            "telem_category": {"$eq": "exploit"},
+                            "data.exploitation_result": {"$eq": True},
+                            "data.machine.ip_addr": {"$in": monkey_json["ip_addresses"]},
+                            "monkey_guid": {"$eq": parent},
+                        }
+                    )
+                ]
+                if 1 == len(exploit_telem):
+                    parent_to_add = (
+                        exploit_telem[0].get("monkey_guid"),
+                        exploit_telem[0].get("data").get("exploiter"),
+                    )
+                else:
+                    parent_to_add = (parent, None)
+            elif (
+                not parent or parent == monkey_json.get("guid")
+            ) and "ip_addresses" in monkey_json:
+                exploit_telem = [
+                    x
+                    for x in mongo.db.telemetry.find(
+                        {
+                            "telem_category": {"$eq": "exploit"},
+                            "data.exploitation_result": {"$eq": True},
+                            "data.machine.ip_addr": {"$in": monkey_json["ip_addresses"]},
+                        }
+                    )
+                ]
+
+                if 1 == len(exploit_telem):
+                    parent_to_add = (
+                        exploit_telem[0].get("monkey_guid"),
+                        exploit_telem[0].get("data").get("exploiter"),
+                    )
+
+            if not db_monkey:
+                monkey_json["parent"] = [parent_to_add]
+            else:
+                monkey_json["parent"] = db_monkey.get("parent") + [parent_to_add]
+
+            tunnel_host_ip = None
+            if "tunnel" in monkey_json:
+                tunnel_host_ip = monkey_json["tunnel"].split(":")[-2].replace("//", "")
+                monkey_json.pop("tunnel")
+
+            ttl = create_monkey_ttl_document(DEFAULT_MONKEY_TTL_EXPIRY_DURATION_IN_SECONDS)
+            monkey_json["ttl_ref"] = ttl.id
+
+            mongo.db.monkey.update(
+                {"guid": monkey_json["guid"]}, {"$set": monkey_json}, upsert=True
+            )
+
+            # Merge existing scanned node with new monkey
+
+            new_monkey_id = mongo.db.monkey.find_one({"guid": monkey_json["guid"]})["_id"]
+
+            if tunnel_host_ip is not None:
+                NodeService.set_monkey_tunnel(new_monkey_id, tunnel_host_ip)
+
+            existing_node = mongo.db.node.find_one(
+                {"ip_addresses": {"$in": monkey_json["ip_addresses"]}}
+            )
+
+            if existing_node:
+                node_id = existing_node["_id"]
+                EdgeService.update_all_dst_nodes(
+                    old_dst_node_id=node_id, new_dst_node_id=new_monkey_id
+                )
+                mongo.db.node.remove({"_id": node_id})
+
+            return {"id": new_monkey_id}

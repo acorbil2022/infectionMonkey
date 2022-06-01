@@ -1,0 +1,2 @@
+baseURL = "http://staging-infectionmonkey.temp312.kinsta.cloud/docs/"
+canonifyURLs = true

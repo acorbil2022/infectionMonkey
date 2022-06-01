@@ -1,0 +1,6 @@
+{
+  "data_dir": "/monkey_island_data",
+  "mongodb": {
+    "start_mongodb": false
+  }
+}
